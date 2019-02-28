@@ -1,0 +1,323 @@
+---
+title: "Tarea"
+author: "Karla Reyo, Luizet Castro y Patricia Trujillo"
+date: "25 de febrero de 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE, echo=FALSE, warning=FALSE}
+
+#setwd("I:/R/Diplomado")
+setwd("~/Downloads/Diplomado")
+
+library(ggplot2)
+library(dummies)
+library(corrplot)
+library(caret)
+library(gridExtra)
+library(scales)
+library(randomForest)
+library(kableExtra)
+library(gbm)
+library(pROC)
+
+df_train = read.csv("train.csv",header=T,stringsAsFactors = F)
+df_test = read.csv("test.csv",header=T,stringsAsFactors = F)
+#diccionario = read.delim(file="data_description.txt", header = TRUE, sep = "\t")
+diccionario <- read.csv("dictionary.csv",header=T,stringsAsFactors = F)
+```
+## Descripción
+
+El problema consiste en predecir el precio final de cada casa para lo cual tenemos los siguientes datos:
+
+* train.csv - el conjunto de entrenamiento
+* test.csv - el conjunto de prueba
+* data_description.txt - las descripción completa de las columnas
+* sample_submission.csv - un benchmark de una regresi?n lineal
+
+## Diccionario de datos
+
+```{r echo=FALSE}
+kable(diccionario) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+```
+
+## Análisis exploratorio de datos
+
+```{r echo=FALSE}
+cat("El conjunto de datos cuenta con ",ncol(df_train)," columnas y ",nrow(df_train)," observaciones\n\n")
+cat("La tabla se ve como sigue:\n\n")
+
+str(df_train[,c(1:10, 81)])
+```
+
+Ahora veamos la distribución de la variable objetivo
+
+```{r echo=FALSE, warning=FALSE, message=FALSE,}
+ggplot(data=df_train[!is.na(df_train$SalePrice),], aes(x=SalePrice)) +
+        geom_histogram(fill="blue") +
+        scale_x_continuous(labels = comma)
+```
+
+```{r target, echo=FALSE}
+summary(df_train$SalePrice)
+```
+## Limpieza de datos
+
+```{r echo=FALSE}
+mis <- which(colSums(is.na(df_train)) > 0)
+cat('Hay', length(mis), 'columnas con valores missing en el conjunto de entrenamiento\n\n')
+cat("El número de missings por columna es:\n\n")
+sort(colSums(sapply(df_train[mis], is.na)), decreasing = TRUE)
+```
+
+```{r  echo=FALSE}
+mis <- which(colSums(is.na(df_test)) > 0)
+cat('Hay', length(mis), 'columnas con valores missing en el conjunto de prueba\n\n')
+cat("El número de missings por columna es:\n\n")
+sort(colSums(sapply(df_test[mis], is.na)), decreasing = TRUE)
+```
+
+Hicimos un análisis e imputaremos por tipo de variable
+```{r echo=FALSE}
+# Set de entrenamiento
+
+# la mayoria de variables a imputar son categoricas
+#typeof(df_train$PoolQC) == "character"
+
+for (i in 1:ncol(df_train)){
+  if (is.character(df_train[,i]) == TRUE){
+    df_train[i][is.na(df_train[i])] <- 'None'
+  } 
+}
+
+# corregimos el resto dado el tipo de variable
+# la variable es la distancia en pies desde la calle a la propiedad por lo que imputamos por la mediana dado el vecindario
+
+for (i in 1:nrow(df_train)){
+        if(is.na(df_train$LotFrontage[i])){
+               df_train$LotFrontage[i] <- as.integer(median(df_train$LotFrontage[df_train$Neighborhood==df_train$Neighborhood[i]], na.rm=TRUE)) 
+        }
+}
+
+# la variable es el a?o en el que se construy? el garage por lo que imputamos con YearBuilt 
+df_train$GarageYrBlt[is.na(df_train$GarageYrBlt)]<-df_train$YearBuilt[is.na(df_train$GarageYrBlt)]
+
+# la variable es el area de masonry por lo que imputamos con 0
+df_train$MasVnrArea[is.na(df_train$MasVnrArea)] <-0
+
+# la variable es el sistema electrico as? que imputamos con la moda
+df_train$Electrical[is.na(df_train$Electrical)]<-names(sort(-table(df_train$Electrical)))[1]
+
+cat('Después de imputar tenemos', length(which(colSums(is.na(df_train)) > 0)), 'columnas con valores missing')
+
+# Set de prueba
+
+for (i in 1:ncol(df_test)){
+  if (is.character(df_test[,i]) == TRUE){
+    df_test[i][is.na(df_test[i])] <- 'None'
+  } 
+}
+for (i in 1:nrow(df_test)){
+        if(is.na(df_test$LotFrontage[i])){
+               df_test$LotFrontage[i] <- as.integer(median(df_test$LotFrontage[df_test$Neighborhood==df_test$Neighborhood[i]], na.rm=TRUE)) 
+        }
+}
+df_test$GarageYrBlt[is.na(df_test$GarageYrBlt)]<-df_test$YearBuilt[is.na(df_test$GarageYrBlt)]
+df_test$MasVnrArea[is.na(df_test$MasVnrArea)] <-0
+df_test$Electrical[is.na(df_test$Electrical)]<-names(sort(-table(df_test$Electrical)))[1]
+for (i in 1:ncol(df_test)){
+  df_test[i][is.na(df_test[i])] <- 0
+}
+```
+
+```{r echo=FALSE}
+numericVars <- which(sapply(df_train, is.numeric))
+numericVarNames <- names(numericVars)
+cat('Hay', length(numericVars), 'variables num?ricas\n\n')
+
+all_numVar <- df_train[, numericVars]
+cor_numVar <- cor(all_numVar, use="pairwise.complete.obs")
+
+cor_sorted <- as.matrix(sort(cor_numVar[,'SalePrice'], decreasing = TRUE))
+
+CorHigh <- names(which(apply(cor_sorted, 1, function(x) abs(x)>0.5)))
+cor_numVar <- cor_numVar[CorHigh, CorHigh]
+
+cat("Haciendo un análisis de la correlación entre variables númericas, para aquellas que estan altamente correlacionadas con la variable objetivo (SalePrice) podemo ver que existe un problema de multicolinealidad como se observa en la siguiente gráfica.\n\n")
+
+corrplot.mixed(cor_numVar, tl.col="black", tl.pos = "lt")
+```
+
+```{r echo=FALSE}
+
+var_cat <- names(df_train[,sapply(df_train, is.character)])
+cat('Tenemos', length(var_cat), 'columnas con variables categóricas\n')
+```
+
+Podemos convertir las variables categoricas a factores
+```{r echo=FALSE}
+df_train[sapply(df_train, is.character)] <- lapply(df_train[sapply(df_train,
+                                                                   is.character)],
+                                                   as.factor)
+df_test[sapply(df_test, is.character)] <- lapply(df_test[sapply(df_test,
+                                                                   is.character)],
+                                                   as.factor)
+```
+
+O transformarla en dummies
+```{r echo=FALSE}
+aux <-  dummy.data.frame(df_train[var_cat], sep = ".")
+
+df_dummies <- df_train[, !colnames(df_train) %in% var_cat]
+df_dummies <- cbind(df_dummies,aux)
+
+cat("Al final, al crear variables dummies, tenemos un nuevo conjunto de datos con",length(df_dummies))
+```
+
+## Reducción de variables
+
+Haremos reducción de variables con un random forest con ambos escenarios, cuando tenemos factores y cuando tenemos variables dummies.
+
+### Caso con factores
+
+```{r echo=FALSE}
+
+set.seed(1234)
+
+#which(colnames(df_train)=="SalePrice")
+
+factor_RF <- randomForest(x=df_train[,-c(1,81)], y=df_train$SalePrice,
+                         ntree=100,importance=TRUE)
+
+imp_RF <- importance(factor_RF)
+imp_DF <- data.frame(Variables = row.names(imp_RF), MSE = imp_RF[,1])
+imp_factor <- imp_DF[order(imp_DF$MSE, decreasing = TRUE),]
+
+ggplot(imp_factor[1:20,], aes(x=reorder(Variables, MSE), y=MSE, fill=MSE)) + 
+  geom_bar(stat = 'identity') + 
+  labs(x = 'Variables', y= '% incremento en MSE') + #si la variable se selecciona al azar
+  coord_flip() + theme(legend.position="none")
+
+```
+
+### Caso con variables dummies
+
+```{r echo=FALSE}
+
+set.seed(1234)
+
+#which(colnames(df_dummies)=="SalePrice")
+
+dummies_RF <- randomForest(x=df_dummies[,-c(1,38)], y=df_dummies$SalePrice, ntree=100,importance=TRUE)
+
+imp_RF <- importance(dummies_RF)
+imp_DF <- data.frame(Variables = row.names(imp_RF), MSE = imp_RF[,1])
+imp_dummies <- imp_DF[order(imp_DF$MSE, decreasing = TRUE),]
+
+ggplot(imp_dummies[1:20,], aes(x=reorder(Variables, MSE), y=MSE, fill=MSE)) + 
+  geom_bar(stat = 'identity') + 
+  labs(x = 'Variables', y= '% incremento en MSE') + #si la variable se selecciona al azar
+  coord_flip() + theme(legend.position="none")
+
+```
+
+## Feature Engineering
+
+Comenzamos seleccionando las variables en comun entre las variables más importantes de cada random forest
+
+```{r echo=FALSE}
+comunes <- intersect(imp_factor[1:20,1],imp_dummies[1:20,1])
+
+cat("Tenemos",length(comunes),"variables en comun que son las siguientes\n\n")
+
+comunes
+
+```
+
+Es posible generar más features con las variables que no están en la intersección para tener un análisis más completo sin embargo, los dejaremos fuera de nuestro trabajo.
+
+## Modelos
+
+Realizamos varios modelos para estimar el precio de venta de las casas dadas las variables seleccionadas. Utilizamos una regresión lineal, un random forest y un gradient boosting machine.
+
+```{r echo=FALSE}
+# definimos set de entrenamiento y prueba
+
+X_train = df_train[comunes]
+y_train = df_train$SalePrice
+
+X_test = df_test[comunes]
+y_test = df_test$SalePrice
+
+
+ctrl <- trainControl(method = "cv",number = 10)
+
+# linear regression
+model.lm <- train(x=X_train, y=y_train,
+            method = "lm",
+            trControl = ctrl)
+
+# gbm
+grid.gbm <- expand.grid(interaction.depth=c(1,2),
+                    n.trees=c(100,150),
+                    shrinkage=c(0.01,0.1),
+                    n.minobsinnode = 20)
+
+model.gbm <- train(x=X_train, y=y_train,
+                   method = "gbm",
+                   trControl = ctrl,
+                   tuneGrid=grid.gbm,
+                   verbose=FALSE)
+# rf
+grid.rf <- expand.grid(mtry = seq(2, 10, by =2))
+
+model.rf <- train(x=X_train, y=y_train,
+                   method = "rf",
+                   trControl = ctrl,
+                   tuneGrid=grid.rf,
+                   verbose=FALSE)
+cat("Realizamos diferentes modelos con los siguientes parámetros para rf\n\n")
+grid.rf
+
+cat("Y para gbm\n\n")
+grid.gbm
+
+cat("También realizamos una validación para conocer cual es el mejor modelo sin embargo, en ningún caso pudimos rechazar la hipótesis nula como se ve en el siguiente resultado.\n\n")
+compare_models(model.rf,model.gbm)
+
+cat("A continuación encontramos la comparación de los modelos:\n\n")
+res <- resamples(list(lm = model.lm, rf = model.rf, gbm = model.gbm))
+summary(res)
+
+```
+```{r echo=FALSE}
+cat("Basado en las métricas anteriores, elegimos el Rf como mejor modelo. Y tiene los siguientes parámetros\n\n")
+
+model.rf$bestTune
+
+cat("\n\n")
+plot(model.rf) 
+```
+
+```{r echo=FALSE}
+rf.pred <- predict(model.rf,X_test)
+#cat("La matriz de confusión es:\n\n")
+#confusionMatrix(rf.pred,df_train$SalePrice)
+
+cat("Las probabilidades calculadas:\n\n")
+rf.probs <- predict(model.rf,X_test)
+head(rf.probs)
+
+#cat("El ?rea bajo la curva:\n\n")
+#rf.ROC <- roc(predictor=rf.probs$PS,
+#               response=y_test,
+#               levels=rev(levels(y_test)))
+
+#rf.ROC$auc
+
+#cat("La curva ROC:\n\n")
+#plot(gbm.ROC,main="GBM ROC")
+
+```
